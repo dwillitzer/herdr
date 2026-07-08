@@ -101,6 +101,7 @@ fn clear_integration_path_env() {
     std::env::remove_var("XDG_CONFIG_HOME");
     std::env::remove_var(QODERCLI_CONFIG_DIR_ENV_VAR);
     std::env::remove_var(CURSOR_CONFIG_DIR_ENV_VAR);
+    std::env::remove_var(GROK_HOME_ENV_VAR);
 }
 
 fn kimi_hook_command(hook_path: &Path, action: &str) -> String {
@@ -176,6 +177,7 @@ fn windows_supports_only_cli_hook_integrations() {
     assert!(!integration_target_supported(IntegrationTarget::Cursor));
     assert!(!integration_target_supported(IntegrationTarget::Devin));
     assert!(!integration_target_supported(IntegrationTarget::Mastracode));
+    assert!(!integration_target_supported(IntegrationTarget::Grok));
 
     assert!(integration_target_supported(IntegrationTarget::Claude));
     assert!(integration_target_supported(IntegrationTarget::Codex));
@@ -214,6 +216,7 @@ fn windows_does_not_offer_unsupported_integrations_even_when_commands_exist() {
     assert!(!integration_target_available(IntegrationTarget::Cursor));
     assert!(!integration_target_available(IntegrationTarget::Devin));
     assert!(!integration_target_available(IntegrationTarget::Mastracode));
+    assert!(!integration_target_available(IntegrationTarget::Grok));
 
     if let Some(path) = original_path {
         std::env::set_var("PATH", path);
@@ -2597,6 +2600,15 @@ fn bundled_integration_assets_report_session_refs() {
     assert!(MASTRACODE_HOOK_ASSET.contains("agent_session_id"));
     assert!(MASTRACODE_HOOK_ASSET.contains("pane.report_agent"));
     assert!(MASTRACODE_HOOK_ASSET.contains("pane.release_agent"));
+    assert!(GROK_HOOK_ASSET.contains("HERDR_INTEGRATION_ID=grok"));
+    assert!(GROK_HOOK_ASSET.contains("HERDR_INTEGRATION_VERSION=1"));
+    assert!(GROK_HOOK_ASSET.contains("sessionId"));
+    assert!(GROK_HOOK_ASSET.contains("session_id"));
+    assert!(GROK_HOOK_ASSET.contains("agent_session_id"));
+    assert!(GROK_HOOK_ASSET.contains("pane.report_agent_session"));
+    assert!(GROK_HOOK_ASSET.contains("pane.report_agent"));
+    assert!(GROK_HOOK_ASSET.contains("pane.release_agent"));
+    assert!(GROK_HOOK_ASSET.contains("herdr:grok"));
 }
 
 #[test]
@@ -3305,5 +3317,293 @@ fn uninstall_mastracode_errors_when_event_value_not_array() {
     } else {
         std::env::remove_var("HOME");
     }
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_grok_writes_hook_and_managed_hooks_json() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let original_home = std::env::var_os("HOME");
+    let grok_home = base.join("home").join(".grok");
+    fs::create_dir_all(&grok_home).unwrap();
+    // Unrelated user hook file must be left alone.
+    let user_hooks = grok_home.join("hooks");
+    fs::create_dir_all(&user_hooks).unwrap();
+    fs::write(
+        user_hooks.join("user-custom.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo keep-me"}]}]}}"#,
+    )
+    .unwrap();
+    std::env::set_var("HOME", base.join("home"));
+
+    let installed = install_grok().unwrap();
+
+    assert_eq!(
+        installed.hook_path,
+        grok_home.join("hooks").join(GROK_HOOK_INSTALL_NAME)
+    );
+    assert_eq!(
+        installed.hooks_path,
+        grok_home.join("hooks").join(GROK_HOOKS_JSON_INSTALL_NAME)
+    );
+    assert_eq!(
+        fs::read_to_string(&installed.hook_path).unwrap(),
+        GROK_HOOK_ASSET
+    );
+
+    let hooks_file: Value =
+        serde_json::from_str(&fs::read_to_string(&installed.hooks_path).unwrap()).unwrap();
+    let hooks = hooks_file
+        .get("hooks")
+        .and_then(Value::as_object)
+        .expect("managed grok hooks file must contain a hooks object");
+    for (event, action) in GROK_HOOK_EVENTS {
+        let entries = hooks
+            .get(event)
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("missing hooks for {event}"));
+        assert_eq!(entries.len(), 1, "{event} should have one Herdr hook group");
+        let command = entries[0]["hooks"][0]["command"]
+            .as_str()
+            .expect("command string");
+        assert!(command.contains(GROK_HOOK_INSTALL_NAME));
+        assert!(
+            command.ends_with(action) || command.contains(&format!(" {action}")),
+            "command for {event} should include action {action}: {command}"
+        );
+        assert_eq!(entries[0]["hooks"][0]["type"], "command");
+        assert_eq!(entries[0]["hooks"][0]["timeout"], 10);
+        assert!(entries[0].get("matcher").is_none());
+    }
+
+    // User file preserved.
+    assert!(user_hooks.join("user-custom.json").is_file());
+
+    if let Some(home) = original_home {
+        std::env::set_var("HOME", home);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_grok_uses_grok_home_env() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let grok_dir = base.join("custom-grok");
+    fs::create_dir_all(&grok_dir).unwrap();
+    std::env::set_var(GROK_HOME_ENV_VAR, &grok_dir);
+
+    let installed = install_grok().unwrap();
+
+    assert_eq!(
+        installed.hook_path,
+        grok_dir.join("hooks").join(GROK_HOOK_INSTALL_NAME)
+    );
+    assert_eq!(
+        installed.hooks_path,
+        grok_dir.join("hooks").join(GROK_HOOKS_JSON_INSTALL_NAME)
+    );
+
+    clear_integration_path_env();
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_grok_is_idempotent() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let original_home = std::env::var_os("HOME");
+    let home = base.join("home");
+    fs::create_dir_all(home.join(".grok")).unwrap();
+    std::env::set_var("HOME", &home);
+
+    install_grok().unwrap();
+    install_grok().unwrap();
+
+    let hooks_file: Value = serde_json::from_str(
+        &fs::read_to_string(
+            home.join(".grok")
+                .join("hooks")
+                .join(GROK_HOOKS_JSON_INSTALL_NAME),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let hooks = hooks_file.get("hooks").and_then(Value::as_object).unwrap();
+    for (event, _) in GROK_HOOK_EVENTS {
+        assert_eq!(
+            hooks.get(event).and_then(Value::as_array).unwrap().len(),
+            1,
+            "{event} must remain a single entry after reinstall"
+        );
+    }
+
+    if let Some(home_env) = original_home {
+        std::env::set_var("HOME", home_env);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn uninstall_grok_removes_managed_files_and_preserves_user_hooks() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let original_home = std::env::var_os("HOME");
+    let home = base.join("home");
+    let grok_hooks = home.join(".grok").join("hooks");
+    fs::create_dir_all(&grok_hooks).unwrap();
+    fs::write(grok_hooks.join("user-custom.json"), r#"{"hooks":{}}"#).unwrap();
+    std::env::set_var("HOME", &home);
+
+    install_grok().unwrap();
+    let result = uninstall_grok().unwrap();
+
+    assert!(result.removed_hook_file);
+    assert!(result.removed_hooks_file);
+    assert!(!result.hook_path.is_file());
+    assert!(!result.hooks_path.is_file());
+    assert!(
+        grok_hooks.join("user-custom.json").is_file(),
+        "user hook files must survive uninstall"
+    );
+
+    if let Some(home_env) = original_home {
+        std::env::set_var("HOME", home_env);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
+fn install_grok_errors_when_grok_dir_missing() {
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let original_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", base.join("empty-home"));
+    // Do not create ~/.grok
+
+    let err = install_grok().unwrap_err().to_string();
+    assert!(
+        err.contains("grok config directory not found"),
+        "unexpected error: {err}"
+    );
+
+    if let Some(home_env) = original_home {
+        std::env::set_var("HOME", home_env);
+    } else {
+        std::env::remove_var("HOME");
+    }
+    let _ = fs::remove_dir_all(base);
+}
+
+#[cfg(unix)]
+#[test]
+fn grok_hook_reports_session_and_lifecycle_over_socket() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    let _lock = integration_env_lock();
+    // Keep the socket path short: AF_UNIX sun_path is ~108 bytes.
+    let base = std::env::temp_dir().join(format!("hgk-{}-{}", std::process::id(), {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    }));
+    fs::create_dir_all(&base).unwrap();
+    let socket_path = base.join("s.sock");
+    let hook_path = base.join(GROK_HOOK_INSTALL_NAME);
+    fs::write(&hook_path, GROK_HOOK_ASSET).unwrap();
+    make_executable(&hook_path).unwrap();
+
+    let listener = UnixListener::bind(&socket_path).expect("bind short unix socket");
+    let (tx, rx) = mpsc::channel::<String>();
+    let server = thread::spawn(move || {
+        // Expect two reports: session then working.
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept hook report");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.contains(&b'\n') {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let _ = stream.write_all(b"{\"ok\":true}\n");
+            let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+        }
+    });
+
+    let run_hook = |action: &str, payload: &str| {
+        let mut child = std::process::Command::new("bash")
+            .arg(&hook_path)
+            .arg(action)
+            .env("HERDR_ENV", "1")
+            .env("HERDR_SOCKET_PATH", &socket_path)
+            .env("HERDR_PANE_ID", "w1:p1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn grok hook");
+        {
+            let mut stdin = child.stdin.take().expect("stdin");
+            stdin.write_all(payload.as_bytes()).unwrap();
+        }
+        let status = child.wait().expect("wait hook");
+        assert!(
+            status.success(),
+            "hook action {action} exited with {status:?}"
+        );
+    };
+
+    // CamelCase Grok Build session payload.
+    run_hook(
+        "session",
+        r#"{"sessionId":"sess-abc-123","hookEventName":"SessionStart"}"#,
+    );
+    // Lifecycle working with snake_case fallback field.
+    run_hook(
+        "working",
+        r#"{"session_id":"sess-abc-123","hook_event_name":"UserPromptSubmit"}"#,
+    );
+
+    let first = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("session report");
+    let second = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("working report");
+    let _ = server.join();
+
+    let session_req: Value = serde_json::from_str(first.trim()).expect("session json");
+    assert_eq!(session_req["method"], "pane.report_agent_session");
+    assert_eq!(session_req["params"]["agent"], "grok");
+    assert_eq!(session_req["params"]["source"], "herdr:grok");
+    assert_eq!(session_req["params"]["agent_session_id"], "sess-abc-123");
+    assert_eq!(session_req["params"]["pane_id"], "w1:p1");
+
+    let working_req: Value = serde_json::from_str(second.trim()).expect("working json");
+    assert_eq!(working_req["method"], "pane.report_agent");
+    assert_eq!(working_req["params"]["agent"], "grok");
+    assert_eq!(working_req["params"]["state"], "working");
+    assert_eq!(working_req["params"]["agent_session_id"], "sess-abc-123");
+
     let _ = fs::remove_dir_all(base);
 }

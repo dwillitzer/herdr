@@ -251,6 +251,7 @@ pub(crate) fn full_lifecycle_hook_authority(source: &str, agent_label: &str) -> 
             | ("herdr:opencode", "opencode")
             | ("herdr:kilo", "kilo")
             | ("herdr:kimi", "kimi")
+            | ("herdr:grok", "grok")
     )
 }
 
@@ -691,6 +692,13 @@ mod tests {
             "mastracode"
         ));
         assert!(!Agent::SCREEN_MANIFEST_AGENTS.contains(&Agent::Mastracode));
+    }
+
+    #[test]
+    fn grok_is_full_lifecycle_hook_authority_with_screen_fallback() {
+        assert!(full_lifecycle_hook_authority("herdr:grok", "grok"));
+        // Screen manifest remains available when hooks are not installed.
+        assert!(Agent::SCREEN_MANIFEST_AGENTS.contains(&Agent::Grok));
     }
 
     #[test]
